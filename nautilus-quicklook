@@ -1,0 +1,375 @@
+#!/usr/bin/python3
+"""
+nautilus-quicklook: a lightweight previewer for GNOME Files (Nautilus).
+
+Implements the org.gnome.NautilusPreviewer2 D-Bus interface (ShowFile + Close)
+that Nautilus activates on the Space key. Renders Markdown and previews images,
+text and source, PDF, video, audio, and font specimens. Built on PySide6/Qt in
+one process; runs under XWayland (QT_QPA_PLATFORM=xcb) for NVIDIA/wlroots.
+"""
+import os
+
+os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+os.environ.setdefault("DISPLAY", ":0")
+
+import html
+import markdown
+from markdown.extensions.codehilite import CodeHiliteExtension
+
+from PySide6.QtCore import QObject, Slot, ClassInfo, QUrl, Qt, QEvent
+from PySide6.QtGui import QPalette, QColor, QPixmap, QKeySequence, QShortcut, QGuiApplication
+from PySide6.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QStackedWidget, QTextBrowser,
+    QLabel, QScrollArea,
+)
+from PySide6.QtDBus import QDBusConnection, QDBusAbstractAdaptor
+
+BUS_NAME = "org.gnome.NautilusPreviewer"
+OBJ_PATH = "/org/gnome/NautilusPreviewer"
+APP_NAME = "nautilus-quicklook"
+
+MARKDOWN_EXTS = (".md", ".markdown", ".mdown", ".mkd", ".mkdn", ".mdwn", ".mdtxt")
+FONT_EXTS = (".ttf", ".otf", ".ttc", ".otc", ".woff", ".woff2", ".pfb", ".pfa", ".pcf", ".bdf")
+TEXT_MAX_BYTES = 2 * 1024 * 1024
+
+
+def doc_css(dark: bool) -> str:
+    fg = "#e6edf3" if dark else "#1f2328"
+    muted = "#8b949e" if dark else "#59636e"
+    border = "#30363d" if dark else "#d1d9e0"
+    codebg = "#161b22" if dark else "#f4f6f8"
+    link = "#4493f8" if dark else "#0969da"
+    # Qt rich text honours ELEMENT selectors + inline styles. Token colours come
+    # from pygments inline styles (noclasses=True); here we style block elements.
+    return f"""
+    body {{ color:{fg}; font-family:'Cantarell','Noto Sans',sans-serif; font-size:15px; }}
+    h1 {{ font-size:26px; font-weight:600; }}
+    h2 {{ font-size:21px; font-weight:600; }}
+    h3 {{ font-size:18px; font-weight:600; }}
+    h4,h5,h6 {{ font-weight:600; }}
+    a {{ color:{link}; }}
+    code {{ font-family:'JetBrains Mono','Fira Code',monospace; background-color:{codebg}; }}
+    pre {{ font-family:'JetBrains Mono','Fira Code',monospace; background-color:{codebg}; }}
+    blockquote {{ color:{muted}; margin-left:8px; }}
+    th {{ background-color:{codebg}; }}
+    th, td {{ border-color:{border}; }}
+    """
+
+
+def render_markdown_html(path: str, dark: bool) -> str:
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        text = fh.read()
+    md = markdown.Markdown(
+        extensions=[
+            "extra", "sane_lists", "toc", "nl2br", "admonition",
+            CodeHiliteExtension(noclasses=True, guess_lang=False,
+                                pygments_style="monokai" if dark else "default"),
+        ],
+        output_format="html5",
+    )
+    body = md.convert(text)
+    # Qt renders table borders from HTML attributes more reliably than CSS.
+    body = body.replace("<table>", '<table border="1" cellpadding="6" cellspacing="0">')
+    return body
+
+
+def render_text_html(path: str) -> str:
+    from pygments import highlight
+    from pygments.lexers import get_lexer_for_filename, TextLexer
+    from pygments.formatters import HtmlFormatter
+    from pygments.util import ClassNotFound
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        text = fh.read()
+    try:
+        lexer = get_lexer_for_filename(path, text)
+    except ClassNotFound:
+        lexer = TextLexer()
+    return highlight(text, lexer, HtmlFormatter(noclasses=True, style="monokai"))
+
+
+def note_html(msg: str) -> str:
+    return f"<div style='color:#8b949e; padding:24px;'>{html.escape(msg)}</div>"
+
+
+class Previewer(QObject):
+    def __init__(self, app: QApplication):
+        super().__init__()
+        self.app = app
+        self.current_uri = None
+        self._player = None
+        self._audio = None
+        self._dark_cache = None
+        self._was_active = False
+        self._build()
+
+    # --- window -----------------------------------------------------------
+    def _build(self):
+        self.win = QWidget()
+        self.win.setWindowTitle("Preview")
+        self.win.resize(920, 820)
+        lay = QVBoxLayout(self.win)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.stack = QStackedWidget()
+        lay.addWidget(self.stack)
+
+        # 0: rich-text (markdown / source / notes)
+        self.browser = QTextBrowser()
+        self.browser.setOpenExternalLinks(True)
+        self.browser.setFrameStyle(0)
+        self.stack.addWidget(self.browser)
+
+        # 1: image
+        self.img_scroll = QScrollArea()
+        self.img_scroll.setWidgetResizable(True)
+        self.img_scroll.setFrameStyle(0)
+        self.img_label = QLabel(alignment=Qt.AlignCenter)
+        self.img_scroll.setWidget(self.img_label)
+        self.stack.addWidget(self.img_scroll)
+
+        self._pdf_view = None
+        self._video = None
+
+        for key in ("Escape", "Space"):
+            QShortcut(QKeySequence(key), self.win, activated=self.hide_window)
+        self.win.installEventFilter(self)
+
+    def eventFilter(self, obj, ev):
+        # Quick-Look behaviour: clicking back to Nautilus closes the preview.
+        # Only after the window has actually held focus once, so it doesn't
+        # self-hide the instant it opens if the compositor is slow to focus it.
+        if obj is self.win and not os.environ.get("QUICKLOOK_NO_AUTOHIDE"):
+            if ev.type() == QEvent.WindowActivate:
+                self._was_active = True
+            elif ev.type() == QEvent.WindowDeactivate and self._was_active:
+                self._was_active = False
+                self.hide_window()
+        return False
+
+    def _dark(self) -> bool:
+        if self._dark_cache is None:
+            self._dark_cache = self._detect_dark()
+        return self._dark_cache
+
+    def _detect_dark(self) -> bool:
+        # Qt's styleHints().colorScheme() is Unknown under xcb, so read the
+        # freedesktop appearance portal directly (color-scheme: 1 == dark),
+        # then fall back to the GTK config / env.
+        try:
+            from PySide6.QtDBus import QDBusInterface
+            iface = QDBusInterface("org.freedesktop.portal.Desktop",
+                                   "/org/freedesktop/portal/desktop",
+                                   "org.freedesktop.portal.Settings",
+                                   QDBusConnection.sessionBus())
+            if iface.isValid():
+                val = iface.call("Read", "org.freedesktop.appearance", "color-scheme").arguments()[0]
+                for _ in range(4):
+                    if hasattr(val, "variant"):
+                        val = val.variant()
+                    else:
+                        break
+                return int(val) == 1
+        except Exception:
+            pass
+        try:
+            with open(os.path.expanduser("~/.config/gtk-3.0/settings.ini")) as fh:
+                c = fh.read().lower()
+            if "prefer-dark-theme=true" in c or "-dark" in c:
+                return True
+        except Exception:
+            pass
+        return "dark" in os.environ.get("GTK_THEME", "").lower()
+
+    def _apply_theme(self, dark: bool):
+        pal = self.win.palette()
+        bg = QColor("#0d1117") if dark else QColor("#ffffff")
+        fg = QColor("#e6edf3") if dark else QColor("#1f2328")
+        for role in (QPalette.Base, QPalette.Window):
+            pal.setColor(role, bg)
+        for role in (QPalette.Text, QPalette.WindowText):
+            pal.setColor(role, fg)
+        self.win.setPalette(pal)
+        self.browser.setPalette(pal)
+
+    # --- D-Bus entry points ----------------------------------------------
+    def show_file(self, uri: str, close_if_shown: bool):
+        if close_if_shown and self.win.isVisible() and uri == self.current_uri:
+            self.hide_window()
+            return
+        self.current_uri = uri
+        path = QUrl(uri).toLocalFile()
+        dark = self._dark()
+        self._apply_theme(dark)
+        self._stop_media()
+
+        title = os.path.basename(path) if path else "Preview"
+        self.win.setWindowTitle(title)
+
+        try:
+            self._dispatch(path, dark)
+        except Exception as exc:
+            self.browser.document().setDefaultStyleSheet(doc_css(dark))
+            self.browser.setHtml(note_html(f"Preview failed: {exc}"))
+            self.stack.setCurrentWidget(self.browser)
+
+        self.win.showNormal()
+        self.win.raise_()
+        self.win.activateWindow()
+
+    def _dispatch(self, path, dark):
+        if not path or not os.path.exists(path):
+            self._html(note_html("No local preview available for this location."), dark)
+            return
+        from PySide6.QtCore import QMimeDatabase
+        mime = QMimeDatabase().mimeTypeForFile(path).name()
+        lower = path.lower()
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = 0
+
+        if lower.endswith(MARKDOWN_EXTS):
+            self._html(render_markdown_html(path, dark), dark, base_dir=os.path.dirname(path))
+        elif mime == "application/pdf" or lower.endswith(".pdf"):
+            self._pdf(path)
+        elif mime.startswith("image/"):
+            self._image(path)
+        elif mime.startswith("video/") or mime.startswith("audio/"):
+            self._media(path, mime.startswith("video/"))
+        elif lower.endswith(FONT_EXTS) or mime.startswith("font/") or "font" in mime:
+            self._font(path, dark)
+        elif size > TEXT_MAX_BYTES:
+            self._html(note_html(f"File too large to preview inline ({size // 1024} KiB)."), dark)
+        elif mime.startswith("text/") or mime in ("application/json", "application/xml",
+                                                   "application/javascript", "application/x-shellscript"):
+            self._html(render_text_html(path), dark)
+        else:
+            self._html(note_html(f"No inline preview for this file type ({mime or 'unknown'})."), dark)
+
+    # --- renderers --------------------------------------------------------
+    def _html(self, body, dark, base_dir=None):
+        self.browser.document().setDefaultStyleSheet(doc_css(dark))
+        if base_dir:
+            self.browser.setSearchPaths([base_dir])
+        self.browser.setHtml(body)
+        self.stack.setCurrentWidget(self.browser)
+
+    def _image(self, path):
+        pm = QPixmap(path)
+        if pm.isNull():
+            self._html(note_html("Could not load image."), self._dark())
+            return
+        area = self.win.size()
+        scaled = pm.scaled(area.width() - 20, area.height() - 20,
+                           Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.img_label.setPixmap(scaled)
+        self.stack.setCurrentWidget(self.img_scroll)
+
+    def _font(self, path, dark):
+        from PySide6.QtGui import QFontDatabase
+        fid = QFontDatabase.addApplicationFont(path)
+        fams = QFontDatabase.applicationFontFamilies(fid) if fid != -1 else []
+        if not fams:
+            self._html(note_html("Could not load font."), dark)
+            return
+        fam = html.escape(fams[0])
+        pangram = "The quick brown fox jumps over the lazy dog"
+        parts = [f"<h1 style=\"font-family:'{fam}'\">{fam}</h1>",
+                 f"<div style=\"font-family:'{fam}'; font-size:22px\">"
+                 "ABCDEFGHIJKLMNOPQRSTUVWXYZ<br>abcdefghijklmnopqrstuvwxyz<br>"
+                 "0123456789 &amp; .,;:!?()[]{}/@#$%</div><hr>"]
+        for s in (12, 18, 24, 36, 48, 64):
+            parts.append(f"<div style=\"font-family:'{fam}'; font-size:{s}px; margin-bottom:6px\">{pangram}</div>")
+        self._html("".join(parts), dark)
+
+    def _pdf(self, path):
+        try:
+            from PySide6.QtPdf import QPdfDocument
+            from PySide6.QtPdfWidgets import QPdfView
+        except ImportError:
+            self._html(note_html("PDF preview needs the Qt PDF backend. "
+                                 "Install qt6-webengine for PDF preview."), self._dark())
+            return
+        if self._pdf_view is None:
+            self._pdf_doc = QPdfDocument(self)
+            self._pdf_view = QPdfView()
+            self._pdf_view.setDocument(self._pdf_doc)
+            self._pdf_view.setPageMode(QPdfView.PageMode.MultiPage)
+            self._pdf_view.setZoomMode(QPdfView.ZoomMode.FitToWidth)
+            self.stack.addWidget(self._pdf_view)
+        self._pdf_doc.load(path)
+        self.stack.setCurrentWidget(self._pdf_view)
+
+    def _media(self, path, is_video):
+        try:
+            from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+            from PySide6.QtMultimediaWidgets import QVideoWidget
+        except ImportError:
+            self._html(note_html("Media preview needs the Qt multimedia backend. "
+                                 "Install qt6-multimedia for video and audio preview."), self._dark())
+            return
+        if self._video is None:
+            self._video = QVideoWidget()
+            self.stack.addWidget(self._video)
+        if self._player is None:
+            self._player = QMediaPlayer(self)
+            self._audio = QAudioOutput(self)
+            self._player.setAudioOutput(self._audio)
+            self._player.setVideoOutput(self._video)
+        self._player.setSource(QUrl.fromLocalFile(path))
+        self._player.play()
+        self.stack.setCurrentWidget(self._video)
+
+    def _stop_media(self):
+        if self._player is not None:
+            self._player.stop()
+
+    # --- lifecycle --------------------------------------------------------
+    def hide_window(self):
+        self._was_active = False
+        self._stop_media()
+        self.win.hide()
+        # Cold start is ~0.4s, so there is nothing to gain by lingering: quit
+        # and release the RAM immediately. D-Bus re-activates on the next preview.
+        self.app.quit()
+
+
+@ClassInfo({"D-Bus Interface": "org.gnome.NautilusPreviewer2"})
+class PreviewerAdaptor(QDBusAbstractAdaptor):
+    def __init__(self, parent, previewer):
+        super().__init__(parent)
+        self._p = previewer
+
+    @Slot(str, str, bool, str)
+    def ShowFile(self, uri, window_handle, close_if_shown, activation_token):
+        try:
+            self._p.show_file(uri, close_if_shown)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+
+    @Slot()
+    def Close(self):
+        self._p.hide_window()
+
+
+def main():
+    app = QApplication([])
+    app.setApplicationName(APP_NAME)
+    app.setDesktopFileName(APP_NAME)
+    app.setQuitOnLastWindowClosed(False)  # we hide, then quit explicitly
+
+    previewer = Previewer(app)
+    previewer._dark()  # prime color-scheme detection before serving D-Bus calls
+    root = QObject()
+    PreviewerAdaptor(root, previewer)
+
+    bus = QDBusConnection.sessionBus()
+    bus.registerObject(OBJ_PATH, root)   # exports the adaptor's interface
+    if not bus.registerService(BUS_NAME):
+        # Another owner already has it; nothing to do.
+        return 0
+    return app.exec()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,14 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Editor / OS cruft
+*.swp
+*~
+.DS_Store
+
+# Local makepkg build output (if a PKGBUILD is kept in-tree)
+/src/
+/pkg/
+*.pkg.tar.*
